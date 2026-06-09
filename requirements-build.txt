@@ -1,0 +1,4 @@
+# Only needed to produce standalone Windows .exe files (PyInstaller).
+# Not required to run from source: pip install -r requirements.txt
+pyinstaller>=6.0,<7
+pyinstaller-hooks-contrib>=2024.8

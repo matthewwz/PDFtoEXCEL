@@ -1,0 +1,33 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# PDF and Excel (local / sample data)
+*.pdf
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# PyInstaller
+build/
+dist/
+*.spec

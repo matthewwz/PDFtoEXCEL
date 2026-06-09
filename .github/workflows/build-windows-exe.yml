@@ -1,0 +1,37 @@
+# Portable Windows .exe (bundles Python + dependencies).
+# Actions → "Build Windows executable" → Run workflow.
+name: Build Windows executable
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: PyInstaller
+        run: >
+          python -m PyInstaller
+          --noconfirm --clean
+          --windowed --onefile
+          --collect-all pdfplumber
+          --collect-all pypdfium2
+          --name PDFtoExcel
+          gui.py
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: PDFtoExcel-windows-exe
+          path: dist/PDFtoExcel.exe
