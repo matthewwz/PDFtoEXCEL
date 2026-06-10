@@ -9,9 +9,10 @@ jobs:
   windows-exe:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      # Node 24–based actions (Node 20 deprecated on Actions → removed Sept 2026)
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -31,7 +32,7 @@ jobs:
           gui.py
 
       - name: Upload executable
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: PDFtoExcel-windows-exe
           path: dist/PDFtoExcel.exe

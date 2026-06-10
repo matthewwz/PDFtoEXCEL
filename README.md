@@ -39,21 +39,13 @@ The app does **not** automatically close Excel for you (doing so could lose unsa
 
 ## Windows without Python (standalone `.exe`)
 
-End users can run a single executable with no Python or `pip` on their PC. Someone (or CI) builds it once with **PyInstaller**, which embeds Python and libraries.
+End users can run a single executable with no Python or `pip` on their PC. The **GitHub Actions** workflow builds it with **PyInstaller**, which embeds Python and libraries.
 
-**Option A — build on GitHub**
+**Build on GitHub**
 
 1. Push this repo to GitHub.
 2. **Actions** → **“Build Windows executable”** → **Run workflow**.
 3. Download the artifact **PDFtoExcel-windows-exe** (`PDFtoExcel.exe`).
-
-**Option B — build on a Windows PC**
-
-```powershell
-.\scripts\build_windows.ps1
-```
-
-Output: `dist\PDFtoExcel.exe`
 
 First launch may be slow while Windows scans the file; some antivirus tools flag unsigned PyInstaller binaries (code signing helps).
 
