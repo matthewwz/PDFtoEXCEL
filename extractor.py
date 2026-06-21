@@ -68,25 +68,6 @@ def _run_with_file_lock_retries(operation) -> None:
             time.sleep(_SAVE_DELAY_SEC)
     raise PermissionError(_EXCEL_LOCK_USER_MESSAGE) from last
 
-# Column order for new workbooks and appended rows
-EXCEL_COLUMNS = [
-    "File",
-    "Date",
-    "Model",
-    "Description",
-    "Submitter",
-    "Report No.",
-    "Label",
-    "Batch Size",
-]
-
-
-def _line_is_equipment_description_header(line: str) -> bool:
-    """Match label whether the PDF uses ASCII or typographic apostrophe in *l'équipement*."""
-    if "Equipment Description" not in line or "Description de l" not in line:
-        return False
-    return "équipement" in line and ":" in line
-
 
 def _extract_batch_size(full_text: str) -> str | None:
     """Batch size from *Batch Size / Nombre d'échantillon*, or fallbacks when OCR omits the digit."""
@@ -224,7 +205,6 @@ def _extract_from_acroform(pdf_path: str) -> dict[str, str | None]:
     empty = {
         "Date": None,
         "Model": None,
-        "Description": None,
         "Submitter": None,
         "Mfr": None,
         "Report No.": None,
@@ -249,8 +229,6 @@ def _extract_from_acroform(pdf_path: str) -> dict[str, str | None]:
             out["Submitter"] = sval
         elif (re.search(r"\bmfr\b", nn) or "fabricant" in nn) and "row" not in nn:
             out["Mfr"] = sval
-        elif "equipment description" in nn and "row" not in nn:
-            out["Description"] = sval
         elif "model" in nn and ("modèle" in nn or "modele" in nn) and "row" not in nn:
             out["Model"] = sval
         elif "date2_af_date" in nn or re.search(r"\bmdy\b|mm/jj/aaaa", nn):
@@ -281,40 +259,6 @@ def _report_and_company_from_filename(pdf_path: str) -> tuple[str | None, str | 
     rest = re.sub(r"(?i)(\s+new forms.*|\s+copy.*)$", "", rest).strip()
     company = rest or None
     return report, company
-
-
-def _description_from_equipment_line(line: str) -> str | None:
-    m = re.search(
-        r"Equipment Description\s*(?:/\s*|\|\s*)\s*Description de l['\u2019]?équipement\s*:\s*(.+)$",
-        line,
-        re.IGNORECASE,
-    )
-    if not m:
-        return None
-    frag = m.group(1).strip()
-    # Stop if another bilingual label starts mid-line (rare merged export)
-    cut = re.split(
-        r"(?i)\s+(?:Address\s*(?:/\s*|\|\s*)\s*Adresse|Client\s*#|Contact\s*(?:/\s*|\|\s*))",
-        frag,
-        maxsplit=1,
-    )
-    return cut[0].strip() or None
-
-
-def _description_from_following_address_line(next_line: str) -> str | None:
-    for addr in (
-        "Address / Adresse:",
-        "Address / Adresse :",
-        "Address | Adresse:",
-        "Address | Adresse :",
-    ):
-        idx = next_line.find(addr)
-        if idx == -1:
-            continue
-        description = next_line[idx + len(addr) :].strip()
-        description = re.sub(r"^\d+\s+\S+[^,]*,", "", description).strip()
-        return description or None
-    return None
 
 
 def _extract_submitter_from_text(text: str) -> str | None:
@@ -493,16 +437,6 @@ def process_pdf(pdf_path):
         if text is None:
             raise ValueError("No text found on the first page.")
 
-        lines = text.split("\n")
-
-        description = None
-        for i, line in enumerate(lines):
-            if _line_is_equipment_description_header(line):
-                description = _description_from_equipment_line(line)
-                if description is None and i + 1 < len(lines):
-                    description = _description_from_following_address_line(lines[i + 1])
-                break
-
         date = _extract_date_from_text(text)
         model = _extract_model_from_text(text)
         submitter = _extract_submitter_from_text(text)
@@ -524,7 +458,6 @@ def process_pdf(pdf_path):
     model = coalesce(model, "Model")
     submitter = coalesce(submitter, "Submitter")
     submitter = submitter or form.get("Mfr")
-    description = coalesce(description, "Description")
     batch_size = batch_size or form.get("Batch Size")
     label = label or form.get("Label")
 
@@ -537,7 +470,6 @@ def process_pdf(pdf_path):
         "File": pdf_path,
         "Date": date,
         "Model": model,
-        "Description": description,
         "Submitter": submitter,
         "Report No.": report_num,
         "Label": label,
