@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import time
+from datetime import date, datetime
 
 import pandas as pd
 import pdfplumber
@@ -125,15 +126,48 @@ def _extract_batch_size(full_text: str) -> str | None:
 _LABEL_FROM_TEXT_RE = re.compile(r"^C-\s*\d+$", re.IGNORECASE)
 
 
+def _decode_pdf_string(v) -> str:
+    """Decode a PDF string (field name or value); may be UTF-16BE/LE with BOM."""
+    if v is None:
+        return ""
+    if isinstance(v, dict):
+        return ""
+    if isinstance(v, bytes):
+        if len(v) >= 2:
+            if v[:2] == b"\xfe\xff":
+                try:
+                    return v[2:].decode("utf-16-be").strip()
+                except UnicodeDecodeError:
+                    pass
+            if v[:2] == b"\xff\xfe":
+                try:
+                    return v[2:].decode("utf-16-le").strip()
+                except UnicodeDecodeError:
+                    pass
+        try:
+            return v.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return v.decode("latin-1", "replace").strip()
+    text = str(v).strip()
+    if not text:
+        return ""
+    if text.startswith("\xfe\xff") or "\x00" in text:
+        try:
+            return text.encode("latin-1", "replace").decode("utf-16-be").strip("\ufeff").strip()
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            try:
+                return text.encode("latin-1", "replace").decode("utf-16-le").strip("\ufeff").strip()
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                pass
+    return text
+
+
 def _decode_pdf_field_value(v) -> str | None:
     if v is None:
         return None
     if isinstance(v, dict):
         return None
-    if isinstance(v, bytes):
-        s = v.decode("latin-1", "replace").strip()
-    else:
-        s = str(v).strip()
+    s = _decode_pdf_string(v)
     if not s:
         return None
     if s.startswith("/'") and s.endswith("'"):
@@ -147,7 +181,12 @@ def _acro_norm_name(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "").strip().lower())
 
 
-def _iter_leaf_acroform_widgets(pdf_path: str):
+def _iter_resolved_acroform_fields(pdf_path: str):
+    """Yield *(field_name, decoded_value)* for each leaf AcroForm widget.
+
+    All ``resolve1`` calls happen while the PDF file is still open — some forms
+    store field values as indirect objects that cannot be read after close.
+    """
     with open(pdf_path, "rb") as fp:
         parser = PDFParser(fp)
         doc = PDFDocument(parser)
@@ -170,7 +209,11 @@ def _iter_leaf_acroform_widgets(pdf_path: str):
                 for k in resolve1(kids):
                     yield from walk(k)
                 return
-            yield f
+            raw_name = _decode_pdf_string(resolve1(f.get("T")) if f.get("T") else "")
+            val = f.get("V")
+            val = resolve1(val) if val else None
+            sval = _decode_pdf_field_value(val)
+            yield raw_name, sval
 
         for ref in fields:
             yield from walk(ref)
@@ -183,25 +226,20 @@ def _extract_from_acroform(pdf_path: str) -> dict[str, str | None]:
         "Model": None,
         "Description": None,
         "Submitter": None,
+        "Mfr": None,
         "Report No.": None,
         "Label": None,
         "Batch Size": None,
     }
     try:
-        widgets = list(_iter_leaf_acroform_widgets(pdf_path))
+        fields = list(_iter_resolved_acroform_fields(pdf_path))
     except Exception:
         return empty
-    if not widgets:
+    if not fields:
         return empty
     out = dict(empty)
     label_candidates: list[str] = []
-    for w in widgets:
-        raw_name = resolve1(w.get("T")) if w.get("T") else ""
-        if isinstance(raw_name, bytes):
-            raw_name = raw_name.decode("latin-1", "replace")
-        val = w.get("V")
-        val = resolve1(val) if val else None
-        sval = _decode_pdf_field_value(val)
+    for raw_name, sval in fields:
         if not sval:
             continue
         nn = _acro_norm_name(raw_name)
@@ -209,6 +247,8 @@ def _extract_from_acroform(pdf_path: str) -> dict[str, str | None]:
             label_candidates.append(sval)
         if ("entreprise" in nn or re.match(r"^company\b", nn)) and "signature" not in nn:
             out["Submitter"] = sval
+        elif (re.search(r"\bmfr\b", nn) or "fabricant" in nn) and "row" not in nn:
+            out["Mfr"] = sval
         elif "equipment description" in nn and "row" not in nn:
             out["Description"] = sval
         elif "model" in nn and ("modèle" in nn or "modele" in nn) and "row" not in nn:
@@ -218,21 +258,26 @@ def _extract_from_acroform(pdf_path: str) -> dict[str, str | None]:
                 out["Date"] = sval
         elif re.search(r"report\s*#|no\s+du\s+rapport|no\.\s*rapport", nn):
             out["Report No."] = sval
-        elif nn == "batch size" or (nn.startswith("batch size") and "sample" not in nn):
-            if re.fullmatch(r"\d+", sval.strip()):
-                out["Batch Size"] = sval.strip()
+        elif re.search(r"\bbatch size\b", nn) and "row" not in nn:
+            m = re.match(r"(\d+)", sval.strip())
+            if m:
+                out["Batch Size"] = m.group(1)
     if label_candidates:
         out["Label"] = label_candidates[0]
     return out
 
 
 def _report_and_company_from_filename(pdf_path: str) -> tuple[str | None, str | None]:
-    """*SI#2026-WZ-1084 smart flex Lighting NEW FORMS copy.pdf* → report + company tail."""
+    """*SI#2026-WZ-1084 smart flex Lighting NEW FORMS copy.pdf* → report + company tail.
+
+    Report numbers may have extra characters after the final digit group (e.g. *1086a*);
+    only the core *YYYY-XX-NNN* segment is kept.
+    """
     stem = re.sub(r"\.pdf\s*$", "", os.path.basename(pdf_path), flags=re.IGNORECASE)
-    m = re.match(r"(?i)(?:SI#)?(\d{4}-\w+-\d+)\s+(.+)$", stem.strip())
+    m = re.match(r"(?i)(?:SI#)?(\d{4}-\w+-\d+)[^\s]*\s+(.+)$", stem.strip())
     if not m:
         return None, None
-    report, rest = m.group(1), m.group(2).strip()
+    report, rest = _normalize_intertek_report_no(m.group(1)), m.group(2).strip()
     rest = re.sub(r"(?i)(\s+new forms.*|\s+copy.*)$", "", rest).strip()
     company = rest or None
     return report, company
@@ -291,6 +336,41 @@ def _extract_submitter_from_text(text: str) -> str | None:
     return None
 
 
+_DATE_PARSE_FORMATS = (
+    "%m/%d/%Y",
+    "%m/%d/%y",
+    "%Y-%m-%d",
+    "%d/%m/%Y",
+    "%d/%m/%y",
+)
+
+_COLUMN_B_DATE_FORMAT = "mmmm d, yyyy"
+
+
+def _parse_pdf_date(raw: str | None) -> date | None:
+    """Parse PDF date strings (e.g. *05/09/2026*) to a calendar date."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    for fmt in _DATE_PARSE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _resolve_column_b_date(new_data: dict, override: str | None) -> date | None:
+    """Column B: manual override when parseable, else date extracted from the PDF."""
+    if override is not None and str(override).strip():
+        parsed = _parse_pdf_date(str(override).strip())
+        if parsed is not None:
+            return parsed
+    return _parse_pdf_date(new_data.get("Date"))
+
+
 def _extract_date_from_text(text: str) -> str | None:
     m = re.search(r"M.D.Y\s+/\s+M.J.A:\s+([0-9/]+)", text)
     if m:
@@ -309,6 +389,17 @@ def _is_plausible_intertek_report_no(s: str | None) -> bool:
     if not s:
         return False
     return bool(re.fullmatch(r"(?i)\d{4}-\w+-\d+", s.strip()))
+
+
+def _normalize_intertek_report_no(s: str | None) -> str | None:
+    """Keep *YYYY-XX-NNN* and drop any trailing characters (e.g. *2026-WZ-1086a* → *2026-WZ-1086*)."""
+    if not s:
+        return None
+    m = re.match(r"(?i)(\d{4}-\w+-\d+)", str(s).strip())
+    if not m:
+        return None
+    report = m.group(1)
+    return report if _is_plausible_intertek_report_no(report) else None
 
 
 def _extract_model_from_text(text: str) -> str | None:
@@ -343,8 +434,9 @@ def _extract_report_from_text(text: str) -> str | None:
 
 def _pick_report_no(*candidates: str | None) -> str | None:
     for c in candidates:
-        if _is_plausible_intertek_report_no(c):
-            return str(c).strip()
+        report = _normalize_intertek_report_no(c)
+        if report:
+            return report
     return None
 
 
@@ -419,37 +511,38 @@ def process_pdf(pdf_path):
         batch_size = _extract_batch_size(full_text)
         label = _extract_label_from_pdf(pdf)
 
-        form = _extract_from_acroform(pdf_path)
-        report_from_name, company_from_name = _report_and_company_from_filename(pdf_path)
+    form = _extract_from_acroform(pdf_path)
+    report_from_name, company_from_name = _report_and_company_from_filename(pdf_path)
 
-        def coalesce(primary, key: str) -> str | None:
-            if primary:
-                return primary
-            v = form.get(key)
-            return v if v else None
+    def coalesce(primary, key: str) -> str | None:
+        if primary:
+            return primary
+        v = form.get(key)
+        return v if v else None
 
-        date = coalesce(date, "Date")
-        model = coalesce(model, "Model")
-        submitter = coalesce(submitter, "Submitter")
-        description = coalesce(description, "Description")
-        batch_size = batch_size or form.get("Batch Size")
-        label = label or form.get("Label")
+    date = coalesce(date, "Date")
+    model = coalesce(model, "Model")
+    submitter = coalesce(submitter, "Submitter")
+    submitter = submitter or form.get("Mfr")
+    description = coalesce(description, "Description")
+    batch_size = batch_size or form.get("Batch Size")
+    label = label or form.get("Label")
 
-        report_num = _pick_report_no(
-            report_text, form.get("Report No."), report_from_name
-        )
-        submitter = submitter or company_from_name
+    report_num = _pick_report_no(
+        report_text, form.get("Report No."), report_from_name
+    )
+    submitter = submitter or company_from_name
 
-        return {
-            "File": pdf_path,
-            "Date": date,
-            "Model": model,
-            "Description": description,
-            "Submitter": submitter,
-            "Report No.": report_num,
-            "Label": label,
-            "Batch Size": batch_size,
-        }
+    return {
+        "File": pdf_path,
+        "Date": date,
+        "Model": model,
+        "Description": description,
+        "Submitter": submitter,
+        "Report No.": report_num,
+        "Label": label,
+        "Batch Size": batch_size,
+    }
 
 
 def _cell_nonempty(cell) -> bool:
@@ -565,7 +658,7 @@ def _label_serial_columns_e_f(
 
 
 def _append_template_row(ws, new_data: dict, column_b_date: str | None) -> None:
-    """Master sheet: **A** = Report No. if A is empty; B if *column_b_date*; C/D; E/F; J=batch; K=file."""
+    """Master sheet: **A** = Report No. if A is empty; B = PDF date; C/D; E/F; J=batch; K=file."""
     row = _first_row_b_c_d_empty_no_fill(ws)
     blank_fill = PatternFill()
     a_cell = ws.cell(row=row, column=1)
@@ -574,8 +667,11 @@ def _append_template_row(ws, new_data: dict, column_b_date: str | None) -> None:
         if rep is not None and str(rep).strip():
             a_cell.value = str(rep).strip()
             a_cell.fill = blank_fill
-    if column_b_date is not None and str(column_b_date).strip():
-        ws.cell(row=row, column=2, value=str(column_b_date).strip())
+    b_val = _resolve_column_b_date(new_data, column_b_date)
+    if b_val is not None:
+        b_cell = ws.cell(row=row, column=2, value=b_val)
+        b_cell.number_format = _COLUMN_B_DATE_FORMAT
+        b_cell.fill = blank_fill
     c_cell = ws.cell(row=row, column=3)
     d_cell = ws.cell(row=row, column=4)
     c_cell.value = new_data.get("Submitter")
@@ -645,8 +741,9 @@ def update_excel(
     Size** in **J**, and PDF **file name** in **K** (any fill on A/C/D for those
     writes is cleared). If no such row exists through the used range, a new row is added
     after the last row.
-    Column **B** is written only when *column_b_date* is a non-empty string;
-    otherwise cell B on that row is left blank.
+    Column **B** receives the date from the PDF (parsed as a real Excel date,
+    displayed e.g. *May 9, 2026*). Pass *column_b_date* to override with another
+    parseable date string; if neither is available, **B** is left blank.
 
     *sheet_name*: worksheet to use. If omitted or blank, the workbook's **active**
     sheet is used (the tab that was selected when the file was saved in Excel).
@@ -678,7 +775,11 @@ def update_excel(
             wb.close()
             wb = None
             df = pd.read_excel(excel_path, sheet_name=target_sheet, engine="openpyxl")
-            new_data_df = pd.DataFrame([new_data])
+            legacy_row = dict(new_data)
+            legacy_date = _resolve_column_b_date(legacy_row, column_b_date)
+            if legacy_date is not None:
+                legacy_row["Date"] = legacy_date
+            new_data_df = pd.DataFrame([legacy_row])
             df = pd.concat([df, new_data_df], ignore_index=True)
 
             def _legacy_save():

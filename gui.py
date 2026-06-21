@@ -269,7 +269,10 @@ tk.Button(
 
 bf = tk.Frame(main)
 bf.pack(pady=(0, 6), fill=tk.X)
-tk.Label(bf, text="Date for column B (master sheet only, optional):").pack(anchor=tk.W)
+tk.Label(
+    bf,
+    text="Date for column B (optional override; default is the date from each PDF):",
+).pack(anchor=tk.W)
 tk.Entry(bf, textvariable=column_b_date_var, width=62).pack(anchor=tk.W, fill=tk.X)
 
 sf = tk.Frame(main)
