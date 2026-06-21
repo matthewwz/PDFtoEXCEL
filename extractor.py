@@ -518,15 +518,17 @@ def _resolve_worksheet(wb, sheet_name: str | None):
     return wb.active
 
 
-def _first_row_both_c_and_d_empty_no_fill(ws) -> int:
-    """First row where C and D are empty and neither has a background fill."""
+def _first_row_b_c_d_empty_no_fill(ws) -> int:
+    """First row where B, C, and D are empty and none has a background fill."""
     max_r = max(ws.max_row, 1)
     for r in range(1, max_r + 1):
+        b_cell = ws.cell(row=r, column=2)
         c_cell = ws.cell(row=r, column=3)
         d_cell = ws.cell(row=r, column=4)
+        b_ok = not _cell_nonempty(b_cell) and not _cell_has_visible_fill(b_cell)
         c_ok = not _cell_nonempty(c_cell) and not _cell_has_visible_fill(c_cell)
         d_ok = not _cell_nonempty(d_cell) and not _cell_has_visible_fill(d_cell)
-        if c_ok and d_ok:
+        if b_ok and c_ok and d_ok:
             return r
     return max_r + 1
 
@@ -564,7 +566,7 @@ def _label_serial_columns_e_f(
 
 def _append_template_row(ws, new_data: dict, column_b_date: str | None) -> None:
     """Master sheet: **A** = Report No. if A is empty; B if *column_b_date*; C/D; E/F; J=batch; K=file."""
-    row = _first_row_both_c_and_d_empty_no_fill(ws)
+    row = _first_row_b_c_d_empty_no_fill(ws)
     blank_fill = PatternFill()
     a_cell = ws.cell(row=row, column=1)
     if not _cell_nonempty(a_cell):
@@ -636,7 +638,7 @@ def update_excel(
     rows are appended using the original column layout.
 
     Otherwise the file is treated as an existing master list: the **first row
-    where C and D are both empty and neither has a background fill** receives
+    where B, C, and D are all empty and none has a background fill** receives
     **Report No.** in **A** when **A** is empty (otherwise **A** is left unchanged),
     **Submitter** in **C**, **Model** in **D**, serial range **E** (start, after
     stripping a leading *C-*) and **F** (end = start + batch size − 1), **Batch
@@ -644,7 +646,7 @@ def update_excel(
     writes is cleared). If no such row exists through the used range, a new row is added
     after the last row.
     Column **B** is written only when *column_b_date* is a non-empty string;
-    otherwise cell B on that row is left untouched.
+    otherwise cell B on that row is left blank.
 
     *sheet_name*: worksheet to use. If omitted or blank, the workbook's **active**
     sheet is used (the tab that was selected when the file was saved in Excel).
