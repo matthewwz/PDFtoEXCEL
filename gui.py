@@ -2,7 +2,12 @@ import os
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from extractor import create_master_list_workbook, process_pdf, update_excel
+from extractor import (
+    create_master_list_workbook,
+    pdf_already_in_excel,
+    process_pdf,
+    update_excel,
+)
 from pdf_report_sync import sync_pdf_report_from_excel
 
 excel_file_path = None
@@ -193,6 +198,7 @@ def process_queue():
 
     batch = list(pdf_queue)
     ok: list[str] = []
+    skipped: list[str] = []
     failed: list[tuple[str, str]] = []
 
     raw_b = column_b_date_var.get().strip()
@@ -202,6 +208,9 @@ def process_queue():
 
     for file_path in batch:
         try:
+            if pdf_already_in_excel(excel_file_path, file_path, sheet_name=sheet):
+                skipped.append(file_path)
+                continue
             new_data = process_pdf(file_path)
             update_excel(
                 new_data,
@@ -217,6 +226,10 @@ def process_queue():
     if ok:
         lines.append(f"Successfully processed {len(ok)} file(s) (in queue order):")
         lines.extend(f"  • {os.path.basename(p)}" for p in ok)
+    if skipped:
+        lines.append("")
+        lines.append(f"Skipped {len(skipped)} file(s) already in the Excel sheet:")
+        lines.extend(f"  • {os.path.basename(p)}" for p in skipped)
     if failed:
         lines.append("")
         lines.append(
@@ -316,7 +329,7 @@ tk.Label(
     text=(
         "1. Select an Excel file, or create a new master-list workbook (same A–K header layout as an existing master sheet)\n"
         "2. Add PDFs, reorder with Move up/down, use Remove from queue to drop rows\n"
-        "3. Process queue — successes are removed; failures stay in the queue to retry\n"
+        "3. Process queue — successes and duplicates already in Excel are removed; failures stay in the queue to retry\n"
         "4. Optional: “Write Report No. from Excel into PDF form…” — needs File + Report No. columns; "
         "matches the PDF by file name; saves a new PDF (AcroForm templates only)"
     ),

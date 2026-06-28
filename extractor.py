@@ -7,10 +7,11 @@ from datetime import date, datetime
 import pandas as pd
 import pdfplumber
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, PatternFill
+from openpyxl.utils import get_column_letter
 from pdfminer.pdfdocument import PDFDocument
 from pdfminer.pdfparser import PDFParser
 from pdfminer.pdftypes import resolve1
-from openpyxl.styles import PatternFill
 
 # Many PDFs trigger pdfminer FontBBox warnings; text extraction still succeeds.
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
@@ -162,8 +163,27 @@ def _acro_norm_name(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "").strip().lower())
 
 
+def _is_inspection_date_field(norm_name: str) -> bool:
+    """True for the header *M.D.Y / M.J.A* field, not equipment *Cal Due date* rows."""
+    if not norm_name or "cal due date" in norm_name:
+        return False
+    if "date2_af_date" in norm_name or re.search(r"mm/jj/aaaa", norm_name):
+        return True
+    compact = re.sub(r"[\s./-]+", "", norm_name)
+    if compact in ("mdy", "mja"):
+        return True
+    return bool(
+        re.fullmatch(r"m[\s./-]*d[\s./-]*y", norm_name)
+        or re.fullmatch(r"m[\s./-]*j[\s./-]*a", norm_name)
+    )
+
+
 def _iter_resolved_acroform_fields(pdf_path: str):
-    """Yield *(field_name, decoded_value)* for each leaf AcroForm widget.
+    """Yield *(field_name, decoded_value)* for AcroForm fields.
+
+    Parent fields that own widget *Kids* (common on Intertek Word forms) store
+    the name and ``/V`` on the parent; leaf widgets are often unnamed. Those
+    parents are yielded here before descending into children.
 
     All ``resolve1`` calls happen while the PDF file is still open — some forms
     store field values as indirect objects that cannot be read after close.
@@ -185,16 +205,19 @@ def _iter_resolved_acroform_fields(pdf_path: str):
             f = resolve1(field_ref)
             if not f:
                 return
-            kids = f.get("Kids")
-            if kids:
-                for k in resolve1(kids):
-                    yield from walk(k)
-                return
             raw_name = _decode_pdf_string(resolve1(f.get("T")) if f.get("T") else "")
             val = f.get("V")
             val = resolve1(val) if val else None
             sval = _decode_pdf_field_value(val)
-            yield raw_name, sval
+            kids = f.get("Kids")
+            if kids:
+                if raw_name and sval:
+                    yield raw_name, sval
+                for k in resolve1(kids):
+                    yield from walk(k)
+                return
+            if raw_name:
+                yield raw_name, sval
 
         for ref in fields:
             yield from walk(ref)
@@ -225,16 +248,16 @@ def _extract_from_acroform(pdf_path: str) -> dict[str, str | None]:
         nn = _acro_norm_name(raw_name)
         if _LABEL_FROM_TEXT_RE.match(sval):
             label_candidates.append(sval)
-        if ("entreprise" in nn or re.match(r"^company\b", nn)) and "signature" not in nn:
+        if ("entreprise" in nn or re.match(r"^company\b", nn) or re.match(r"^submitter\b", nn)) and "signature" not in nn:
             out["Submitter"] = sval
         elif (re.search(r"\bmfr\b", nn) or "fabricant" in nn) and "row" not in nn:
             out["Mfr"] = sval
         elif "model" in nn and ("modèle" in nn or "modele" in nn) and "row" not in nn:
             out["Model"] = sval
-        elif "date2_af_date" in nn or re.search(r"\bmdy\b|mm/jj/aaaa", nn):
+        elif _is_inspection_date_field(nn):
             if re.search(r"\d", sval):
                 out["Date"] = sval
-        elif re.search(r"report\s*#|no\s+du\s+rapport|no\.\s*rapport", nn):
+        elif re.search(r"report\s*#|report\s+no\b|no\s+du\s+rapport|no\.\s*rapport", nn):
             out["Report No."] = sval
         elif re.search(r"\bbatch size\b", nn) and "row" not in nn:
             m = re.match(r"(\d+)", sval.strip())
@@ -289,6 +312,7 @@ _DATE_PARSE_FORMATS = (
 )
 
 _COLUMN_B_DATE_FORMAT = "mmmm d, yyyy"
+_CENTER_ALIGNMENT = Alignment(horizontal="center", vertical="center")
 
 
 def _parse_pdf_date(raw: str | None) -> date | None:
@@ -347,7 +371,12 @@ def _normalize_intertek_report_no(s: str | None) -> str | None:
 
 
 def _extract_model_from_text(text: str) -> str | None:
-    m = re.search(r"Model\s+/\s+Modèle:\s+(\S+)", text)
+    # Value must be on the same line; do not use \s+ after the colon (it would span to *Tel* on the next line).
+    m = re.search(
+        r"(?m)^[^\n]*Model\s+/\s+Modèle:[ \t]*([^\s\n]+)",
+        text,
+        re.IGNORECASE,
+    )
     if m:
         return m.group(1)
     # Pipe layout: value must be on the same line; do not use \s* after the colon (it would span to *Tel* on the next line).
@@ -543,6 +572,39 @@ def _resolve_worksheet(wb, sheet_name: str | None):
     return wb.active
 
 
+def _excel_file_cell_matches_pdf(cell_value, pdf_path: str) -> bool:
+    if cell_value is None:
+        return False
+    s = str(cell_value).strip()
+    if not s:
+        return False
+    pdf_base = os.path.basename(pdf_path)
+    return os.path.basename(s) == pdf_base or s == pdf_path or s == pdf_base
+
+
+def pdf_already_in_excel(
+    excel_path: str, pdf_path: str, sheet_name: str | None = None
+) -> bool:
+    """True if *pdf_path* already has a row in the workbook (matched by file name)."""
+    if not os.path.exists(excel_path):
+        return False
+    wb = load_workbook(excel_path, read_only=True, data_only=True)
+    try:
+        ws = _resolve_worksheet(wb, sheet_name)
+        if _is_legacy_app_workbook(ws):
+            file_col = 1
+        else:
+            file_col = 11
+        for row in range(2, ws.max_row + 1):
+            if _excel_file_cell_matches_pdf(
+                ws.cell(row=row, column=file_col).value, pdf_path
+            ):
+                return True
+        return False
+    finally:
+        wb.close()
+
+
 def _first_row_b_c_d_empty_no_fill(ws) -> int:
     """First row where B, C, and D are empty and none has a background fill."""
     max_r = max(ws.max_row, 1)
@@ -593,17 +655,26 @@ def _append_template_row(ws, new_data: dict, column_b_date: str | None) -> None:
     """Master sheet: **A** = Report No. if A is empty; B = PDF date; C/D; E/F; J=batch; K=file."""
     row = _first_row_b_c_d_empty_no_fill(ws)
     blank_fill = PatternFill()
+
+    def write_cell(column: int, value, *, number_format: str | None = None) -> None:
+        cell = ws.cell(row=row, column=column, value=value)
+        cell.alignment = _CENTER_ALIGNMENT
+        if number_format is not None:
+            cell.number_format = number_format
+
     a_cell = ws.cell(row=row, column=1)
     if not _cell_nonempty(a_cell):
         rep = new_data.get("Report No.")
         if rep is not None and str(rep).strip():
             a_cell.value = str(rep).strip()
             a_cell.fill = blank_fill
+            a_cell.alignment = _CENTER_ALIGNMENT
     b_val = _resolve_column_b_date(new_data, column_b_date)
     if b_val is not None:
         b_cell = ws.cell(row=row, column=2, value=b_val)
         b_cell.number_format = _COLUMN_B_DATE_FORMAT
         b_cell.fill = blank_fill
+        b_cell.alignment = _CENTER_ALIGNMENT
     c_cell = ws.cell(row=row, column=3)
     d_cell = ws.cell(row=row, column=4)
     c_cell.value = new_data.get("Submitter")
@@ -611,15 +682,51 @@ def _append_template_row(ws, new_data: dict, column_b_date: str | None) -> None:
     # Ensure new values do not keep table banding / highlight fills
     c_cell.fill = blank_fill
     d_cell.fill = blank_fill
+    c_cell.alignment = _CENTER_ALIGNMENT
+    d_cell.alignment = _CENTER_ALIGNMENT
     e_val, f_val = _label_serial_columns_e_f(
         new_data.get("Label"), new_data.get("Batch Size")
     )
-    ws.cell(row=row, column=5, value=e_val)
-    ws.cell(row=row, column=6, value=f_val)
-    ws.cell(row=row, column=10, value=new_data.get("Batch Size"))
+    write_cell(5, e_val)
+    write_cell(6, f_val)
+    write_cell(10, new_data.get("Batch Size"))
     file_path = new_data.get("File")
     if file_path:
-        ws.cell(row=row, column=11, value=os.path.basename(str(file_path)))
+        write_cell(11, os.path.basename(str(file_path)))
+
+
+def _cell_display_length(cell) -> int:
+    val = cell.value
+    if val is None:
+        return 0
+    if isinstance(val, datetime):
+        val = val.date()
+    if isinstance(val, date):
+        return len(f"{val.strftime('%B')} {val.day}, {val.year}")
+    return len(str(val))
+
+
+def _autofit_worksheet_columns(
+    ws,
+    *,
+    min_width: float = 8,
+    max_width: float = 60,
+    padding: int = 2,
+) -> None:
+    """Set column widths from cell content (approximates Excel auto-fit)."""
+    col_max: dict[int, int] = {}
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is None:
+                continue
+            length = _cell_display_length(cell)
+            col_idx = cell.column
+            col_max[col_idx] = max(col_max.get(col_idx, 0), length)
+    for col_idx, max_len in col_max.items():
+        letter = get_column_letter(col_idx)
+        ws.column_dimensions[letter].width = min(
+            max(max_len + padding, min_width), max_width
+        )
 
 
 def create_master_list_workbook(excel_path: str, sheet_title: str = "Sheet1") -> None:
@@ -644,7 +751,9 @@ def create_master_list_workbook(excel_path: str, sheet_title: str = "Sheet1") ->
         11: "File",
     }
     for col, label in headers.items():
-        ws.cell(row=1, column=col, value=label)
+        cell = ws.cell(row=1, column=col, value=label)
+        cell.alignment = _CENTER_ALIGNMENT
+    _autofit_worksheet_columns(ws)
     out_dir = os.path.dirname(os.path.abspath(excel_path)) or "."
     os.makedirs(out_dir, exist_ok=True)
     wb.save(excel_path)
@@ -692,6 +801,7 @@ def update_excel(
         try:
             ws_new = _resolve_worksheet(wb_new, sheet_name)
             _append_template_row(ws_new, new_data, column_b_date)
+            _autofit_worksheet_columns(ws_new)
             _save_workbook_with_retries(wb_new, excel_path)
         finally:
             wb_new.close()
@@ -727,6 +837,7 @@ def update_excel(
             return
 
         _append_template_row(ws, new_data, column_b_date)
+        _autofit_worksheet_columns(ws)
         _save_workbook_with_retries(wb, excel_path)
     finally:
         if wb is not None:
@@ -761,6 +872,9 @@ if __name__ == "__main__":
         raise SystemExit(f"No fileTest*.pdf files found in {root}")
 
     for pdf_path in pdf_paths:
+        if pdf_already_in_excel(str(excel_path), str(pdf_path), sheet_name=sheet_name):
+            print(f"Skipping (already in workbook): {pdf_path.name}")
+            continue
         new_data = process_pdf(str(pdf_path))
         update_excel(
             new_data,
